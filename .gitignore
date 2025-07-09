@@ -1,0 +1,11 @@
+# Python virtual environment
+venv/
+
+# Python cache files
+__pycache__/
+
+# Secret API key file
+apikey.py
+
+# Temporary screenshot files
+screenshot_with_labels.png
