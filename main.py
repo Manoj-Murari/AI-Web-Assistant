@@ -116,6 +116,9 @@ WAIT_TIME = 10
 vision_model_name = 'gemini-1.5-flash-latest'
 vision_model = None
 shared_context = {}
+# ADD: cache planning model & config flag for performance
+planning_model = None  # Lazy-loaded singleton of gemini-1.5-pro-latest
+_genai_configured = False  # Ensures we only call genai.configure once
 _PATH_NOT_FOUND_MARKER_STR = "[{path} not found/extracted]"
 class _NotFoundType: pass
 NOT_FOUND = _NotFoundType()
@@ -164,9 +167,16 @@ def get_gemini_plan(user_goal: str): # Function definition
         if not gemini_api_key:
             print("ERROR: API_KEY is not set in apikey.py or is empty.")
             return None
-        genai.configure(api_key=gemini_api_key)
-        planning_model = genai.GenerativeModel('gemini-1.5-pro-latest')
-        print("DEBUG: Planning model configured successfully.")
+        # Reuse global configuration & planning model to avoid repeated heavy instantiation
+        global planning_model, _genai_configured
+        if not _genai_configured:
+            genai.configure(api_key=gemini_api_key)
+            _genai_configured = True
+        if planning_model is None:
+            planning_model = genai.GenerativeModel('gemini-1.5-pro-latest')
+            print("DEBUG: Planning model instantiated.")
+        else:
+            print("DEBUG: Re-using cached planning model instance.")
 
         full_prompt = PROMPT_TEMPLATE.format(user_goal=user_goal)
 
@@ -326,6 +336,7 @@ def execute_action(step):
     global driver
     global vision_model
     global shared_context
+    global _genai_configured
 
     action_type = step.get("action")
     action_data = step.get("data", {})
@@ -358,6 +369,18 @@ def execute_action(step):
         try:
             screenshot_bytes = driver.get_screenshot_as_png()
             img = Image.open(BytesIO(screenshot_bytes))
+
+            # PERFORMANCE: Compress screenshot to reduce upload size
+            compressed_buffer = BytesIO()
+            try:
+                img.save(compressed_buffer, format="JPEG", quality=80)
+                screenshot_for_model = compressed_buffer.getvalue()
+                mime_type = "image/jpeg"
+                print(f"DEBUG: Compressed screenshot from {len(screenshot_bytes)//1024}KB to {len(screenshot_for_model)//1024}KB before sending to vision model.")
+            except Exception as img_err:
+                print(f"DEBUG: Failed to compress screenshot ({img_err}), falling back to original PNG bytes.")
+                screenshot_for_model = screenshot_bytes
+                mime_type = "image/png"
             vision_prompt = """
             Analyze this screenshot of a webpage. Identify all interactive elements (like buttons, links, input fields, text areas).
             For each element, provide its purpose, bounding box coordinates [x_min, y_min, x_max, y_max], and assign it a unique number.
@@ -372,12 +395,14 @@ def execute_action(step):
             """
             if vision_model is None:
                 print(f"DEBUG: Initializing vision model: {vision_model_name}")
-                # --- MODIFICATION: Use the imported key ---
-                genai.configure(api_key=gemini_api_key)
+                global _genai_configured
+                if not _genai_configured:
+                    genai.configure(api_key=gemini_api_key)
+                    _genai_configured = True
                 vision_model = genai.GenerativeModel(vision_model_name)
             
             print("DEBUG: Sending screenshot to Gemini for element labeling...")
-            image_part = {"mime_type": "image/png", "data": screenshot_bytes}
+            image_part = {"mime_type": mime_type, "data": screenshot_for_model}
             prompt_parts = [vision_prompt, image_part]
             vision_response = vision_model.generate_content(prompt_parts)
             extracted_text = vision_response.text
@@ -507,11 +532,25 @@ def execute_action(step):
         context_key_to_store = action_data.get("context_key_to_store", "last_vision_response")
         try:
             screenshot_bytes = driver.get_screenshot_as_png()
+
+            # PERFORMANCE: compress screenshot
+            try:
+                _img_tmp = Image.open(BytesIO(screenshot_bytes))
+                tmp_buffer = BytesIO()
+                _img_tmp.save(tmp_buffer, format="JPEG", quality=80)
+                screenshot_bytes = tmp_buffer.getvalue()
+                mime_type = "image/jpeg"
+            except Exception as _img_err:
+                print(f"DEBUG: READ_SCREEN compression failed ({_img_err}); using PNG.")
+                mime_type = "image/png"
+
             if vision_model is None:
-                # --- MODIFICATION: Use the imported key ---
-                genai.configure(api_key=gemini_api_key)
+                global _genai_configured
+                if not _genai_configured:
+                    genai.configure(api_key=gemini_api_key)
+                    _genai_configured = True
                 vision_model = genai.GenerativeModel(vision_model_name)
-            image_part = {"mime_type": "image/png", "data": screenshot_bytes}
+            image_part = {"mime_type": mime_type, "data": screenshot_bytes}
             prompt_parts = [custom_vision_prompt, image_part]
             vision_response = vision_model.generate_content(prompt_parts)
             shared_context[context_key_to_store] = vision_response.text
